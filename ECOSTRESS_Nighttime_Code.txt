@@ -1,0 +1,615 @@
+// ===== ECOSTRESS night-time LST: Colossus pilot (Objective 2) =====
+// Step 1: site (0–500 m) minus 3–5 km ring, each night (Colossus and Brownsville)
+// Step 2: Colossus 0.5–2 km ring minus Brownsville 0.5–2 km ring, matching nights
+// Maps: before / after / change, exported as GeoTIFF for QGIS
+
+// ---------- 1. Settings ----------
+var COLOSSUS = ee.Geometry.Point([-90.15639, 35.06000]);
+var BROWNSVILLE = ee.Geometry.Point([-89.26083, 35.59056]);
+var TZ = 'America/Chicago';
+var NIGHT_START = 20;  // 8 pm local
+var NIGHT_END = 5;     // 5 am local
+var MONTH_START = 6;   // June
+var MONTH_END = 8;     // August (change to 5 and 9 for May–September)
+var EARLY = [2020, 2021], BEFORE = [2022, 2023], AFTER = [2025, 2026];
+var MIN_COVER = 0.3;   // keep a zone only if at least 30% of it is clear
+var FOLDER = 'GEE_night_LST';
+var PIX = 70 * 70;
+var MIN_NEAR = Math.round(MIN_COVER * Math.PI * 500 * 500 / PIX);
+var MIN_RING = Math.round(MIN_COVER * Math.PI * (2000 * 2000 - 500 * 500) / PIX);
+var MIN_BG   = Math.round(MIN_COVER * Math.PI * (5000 * 5000 - 3000 * 3000) / PIX);
+
+// ---------- 2. Zones ----------
+function makeZones(p) {
+  return {
+    near: p.buffer(500),
+    ring: p.buffer(2000).difference(p.buffer(500), 1),
+    background: p.buffer(5000).difference(p.buffer(3000), 1)
+  };
+}
+var zC = makeZones(COLOSSUS);
+var zB = makeZones(BROWNSVILLE);
+
+// ---------- 3. Clean each ECOSTRESS scene ----------
+function prepare(im) {
+  var qc = im.select('QC').toInt();
+  var goodRetrieval = qc.bitwiseAnd(3).lte(1)                    // bits 0–1: LST produced
+      .and(qc.rightShift(2).bitwiseAnd(3).eq(0));                 // bits 2–3: good input data
+  var clear = im.select('cloud').toInt().bitwiseAnd(1).eq(0);
+  var land = im.select('water').toInt().bitwiseAnd(1).eq(0);
+  var lst = im.select('LST');
+  var ok = goodRetrieval.and(clear).and(land).and(lst.gt(250)).and(lst.lt(340));
+  var date = im.date();
+  return lst.subtract(273.15).rename('LST_C').updateMask(ok).set({
+    'system:time_start': im.get('system:time_start'),
+    local_hour: date.get('hour', TZ),
+    night: date.advance(-12, 'hour').format('YYYY-MM-dd', TZ)  // 22:00 and 03:00 count as the same night
+  });
+}
+var isNight = ee.Filter.or(
+  ee.Filter.gte('local_hour', NIGHT_START),
+  ee.Filter.lt('local_hour', NIGHT_END));
+
+// ---------- 4. One image per night (averages overlapping tiles) ----------
+function nightlyImages(point) {
+  var scenes = ee.ImageCollection('NASA/ECOSTRESS/L2T_LSTE/V2')
+    .filterBounds(point.buffer(5000))
+    .filterDate('2020-01-01', '2026-11-01')
+    .filter(ee.Filter.calendarRange(MONTH_START, Math.min(MONTH_END + 1, 12), 'month'))
+    .map(prepare)
+    .filter(isNight);
+  var nights = scenes.aggregate_array('night').distinct();
+  var nightly = ee.ImageCollection.fromImages(nights.map(function (d) {
+    var same = scenes.filter(ee.Filter.eq('night', d));
+    var first = ee.Image(same.first());
+    var s = ee.String(d);
+    return same.mean().set({
+      night: s,
+      year: ee.Number.parse(s.slice(0, 4)),
+      month: ee.Number.parse(s.slice(5, 7)),
+      local_hour: first.get('local_hour'),
+      'system:time_start': first.get('system:time_start')
+    });
+  }));
+  return nightly.filter(ee.Filter.rangeContains('month', MONTH_START, MONTH_END));
+}
+
+// ---------- 5. Zone averages for each night ----------
+function zoneStats(im, geom, prefix) {
+  var s = im.select('LST_C').reduceRegion({
+    reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.count(), sharedInputs: true}),
+    geometry: geom, scale: 70, maxPixels: 1e9, tileScale: 4
+  });
+  var out = {};
+  out[prefix + '_C'] = ee.Algorithms.If(s.get('LST_C_mean'), s.get('LST_C_mean'), -9999);
+  out[prefix + '_px'] = s.get('LST_C_count');
+  return out;
+}
+function addStats(z) {
+  return function (im) {
+    return im.set(zoneStats(im, z.near, 'near'))
+             .set(zoneStats(im, z.ring, 'ring'))
+             .set(zoneStats(im, z.background, 'bg'));
+  };
+}
+var colN = nightlyImages(COLOSSUS).map(addStats(zC));
+var bvN  = nightlyImages(BROWNSVILLE).map(addStats(zB));
+
+// ---------- 6. Step 1: site minus 3–5 km ring ----------
+var step1Ok = ee.Filter.and(ee.Filter.gte('near_px', MIN_NEAR), ee.Filter.gte('bg_px', MIN_BG));
+function addContrast(im) {
+  return im.set('C', ee.Number(im.get('near_C')).subtract(ee.Number(im.get('bg_C'))));
+}
+var colS1 = colN.filter(step1Ok).map(addContrast);
+var bvS1  = bvN.filter(step1Ok).map(addContrast);
+
+var PROPS = ['night', 'year', 'month', 'local_hour', 'near_C', 'ring_C', 'bg_C', 'near_px', 'ring_px', 'bg_px'];
+function toTable(ic, extra) {
+  return ee.FeatureCollection(ic.map(function (im) {
+    return ee.Feature(null, im.toDictionary(PROPS.concat(extra)));
+  })).sort('night');
+}
+var colTable1 = toTable(colS1, ['C']);
+var bvTable1  = toTable(bvS1, ['C']);
+
+// ---------- 7. Step 2: Colossus ring minus Brownsville ring, same night ----------
+var ringOk = ee.Filter.gte('ring_px', MIN_RING);
+var joined = ee.Join.inner().apply(
+  toTable(colN.filter(ringOk), []), toTable(bvN.filter(ringOk), []),
+  ee.Filter.equals({leftField: 'night', rightField: 'night'}));
+var step2 = ee.FeatureCollection(joined.map(function (f) {
+  var a = ee.Feature(f.get('primary')), b = ee.Feature(f.get('secondary'));
+  return ee.Feature(null, {
+    night: a.get('night'), year: a.get('year'), local_hour: a.get('local_hour'),
+    colossus_ring_C: a.get('ring_C'), brownsville_ring_C: b.get('ring_C'),
+    R: ee.Number(a.get('ring_C')).subtract(ee.Number(b.get('ring_C')))
+  });
+})).sort('night');
+
+// ---------- 8. Print summaries (nights, mean, standard deviation) ----------
+var PERIODS = [['2020-21 (earlier check)', EARLY], ['2022-23 (before)', BEFORE], ['2025-26 (after)', AFTER]];
+function summarise(fc, prop, label) {
+  print(label, PERIODS.map(function (p) {
+    var s = fc.filter(ee.Filter.inList('year', p[1]));
+    return ee.Dictionary({period: p[0], nights: s.size(),
+      mean_C: s.aggregate_mean(prop), sd_C: s.aggregate_total_sd(prop)});
+  }));
+}
+summarise(colTable1, 'C', 'STEP 1 Colossus: site minus 3–5 km ring');
+summarise(bvTable1, 'C', 'STEP 1 Brownsville: centre minus 3–5 km ring');
+summarise(step2, 'R', 'STEP 2 Colossus ring minus Brownsville ring');
+summarise(colTable1.filter(ee.Filter.lt('local_hour', NIGHT_END)), 'C',
+          'Sensitivity: Colossus Step 1, after-midnight passes only');
+
+// ---------- 9. Maps for QGIS ----------
+function anomaly(im) {
+  return im.select('LST_C').subtract(ee.Number(im.get('bg_C'))).rename('anom');
+}
+var before = colS1.filter(ee.Filter.inList('year', BEFORE));
+var after  = colS1.filter(ee.Filter.inList('year', AFTER));
+var contrastBefore = before.map(anomaly).median();
+var contrastAfter  = after.map(anomaly).median();
+var stack = ee.Image.cat([
+  before.select('LST_C').median().rename('lst_before'),        // band 1
+  after.select('LST_C').median().rename('lst_after'),          // band 2
+  contrastBefore.rename('contrast_before'),                    // band 3
+  contrastAfter.rename('contrast_after'),                      // band 4
+  contrastAfter.subtract(contrastBefore).rename('contrast_change'), // band 5
+  before.select('LST_C').count().rename('n_before'),           // band 6
+  after.select('LST_C').count().rename('n_after')              // band 7
+]).toFloat();
+
+var zones = ee.FeatureCollection([
+  ee.Feature(zC.near, {site: 'Colossus', zone: 'Site 0-500 m'}),
+  ee.Feature(zC.ring, {site: 'Colossus', zone: 'Surroundings 0.5-2 km'}),
+  ee.Feature(zC.background, {site: 'Colossus', zone: 'Background 3-5 km'}),
+  ee.Feature(zB.near, {site: 'Brownsville', zone: 'Centre 0-500 m'}),
+  ee.Feature(zB.ring, {site: 'Brownsville', zone: 'Surroundings 0.5-2 km'}),
+  ee.Feature(zB.background, {site: 'Brownsville', zone: 'Background 3-5 km'})
+]);
+
+Map.setOptions('SATELLITE');
+Map.centerObject(COLOSSUS, 12);
+Map.addLayer(stack.select('contrast_change'),
+  {min: -3, max: 3, palette: ['2166ac', 'f7f7f7', 'b2182b']}, 'Night contrast change (°C)');
+Map.addLayer(stack.select('lst_after'),
+  {min: 18, max: 32, palette: ['000004', '51127c', 'b73779', 'fc8961', 'fcfdbf']}, 'Night LST after (°C)', false);
+Map.addLayer(zones.style({color: 'yellow', fillColor: '00000000', width: 2}), {}, 'Zones');
+
+// ---------- 10. Exports (run them from the Tasks tab) ----------
+Export.image.toDrive({image: stack.unmask(-9999), description: 'Colossus_night_LST',
+  folder: FOLDER, region: COLOSSUS.buffer(6000).bounds(), scale: 70, crs: 'EPSG:32615', maxPixels: 1e9});
+Export.table.toDrive({collection: colTable1, description: 'Night_step1_Colossus', folder: FOLDER,
+  fileFormat: 'CSV', selectors: PROPS.concat(['C'])});
+Export.table.toDrive({collection: bvTable1, description: 'Night_step1_Brownsville', folder: FOLDER,
+  fileFormat: 'CSV', selectors: PROPS.concat(['C'])});
+Export.table.toDrive({collection: step2, description: 'Night_step2_Colossus_vs_Brownsville', folder: FOLDER,
+  fileFormat: 'CSV', selectors: ['night', 'year', 'local_hour', 'colossus_ring_C', 'brownsville_ring_C', 'R']});
+Export.table.toDrive({collection: zones, description: 'Night_zones', folder: FOLDER, fileFormat: 'SHP'});
+
+Matlab Code for figures:
+%% coding out the night time summary
+% evangeline soh 31/10/26 
+%% ========================================================================
+% ECOSTRESS night-time LST analysis - Colossus pilot (Objective 2)
+% ------------------------------------------------------------------------
+% This script reads the two CSV files exported from the Google Earth Engine
+% "version 2" script:
+% Night_scenes_Colossus.csv
+% Night_scenes_Brownsville.csv
+% Each row is ONE night-time ECOSTRESS scene, with the average surface
+% temperature (deg C) and the number of clear pixels in three zones:
+% near = within 500 m of the site centre
+% ring = 0.5-2 km from the centre (surroundings)
+% bg = 3-5 km from the centre (background)
+%
+% What the script calculates:
+% Step 1 : contrast C = near - bg, for every clear night, at both sites
+% Step 2 : R = Colossus ring - Brownsville ring, on matching nights
+% DiD : (Step 1 change at Colossus) - (Step 1 change at Brownsville)
+% Checks : pre-trend (2020-21 vs 2022-23), after-midnight-only
+% sensitivity, and the minimum detectable change
+%
+% Outputs:
+% - Results printed in the Command Window
+% - Night_results_summary.csv (numbers for Table 4 of the report)
+% - Night_step1_Colossus_nightly.csv, Night_step1_Brownsville_nightly.csv,
+% Night_step2_paired_nightly.csv (one row per night, for checking)
+% - Three figures saved as PNG files:
+% Night_fig1_step1_contrast.png -> report Figure 7 (every night)
+% Night_fig2_step2_regional.png -> not used in the report
+% Night_fig3_period_means.png -> report Figure 6 (period means)
+%
+% Changes to the figures (01/11/26):
+% - Period-mean error bars now use the t-value for each period's number
+% of nights instead of 1.96 (1.96 is too narrow for 4-5 nights)
+% - Figure 6: number of nights (n) written beside each point
+% - Figure 7: Brownsville period means added; Colossus passes after
+% midnight are filled, evening passes hollow; 2024 transition-year
+% nights greyed out; start-up window shaded; year labels centred on
+% each summer
+% - Plot titles removed (the report captions do this job) and axis
+% labels use the degree symbol
+%
+% HOW TO RUN: put this script in the same folder as the two CSV files,
+% open it in MATLAB and press Run. No extra toolboxes are needed.
+% ========================================================================
+clear; clc; close all;
+rng(1); % fix the random seed so the bootstrap gives the same answer each run
+%% ---------------- 1. Settings ----------------
+colFile = 'Night_scenes_Colossus.csv';
+bvFile = 'Night_scenes_Brownsville.csv';
+% Year groups (summers only; the Earth Engine script already kept June-August)
+EARLY = [2020 2021]; % earlier pre-operational check (for the pre-trend)
+BEFORE = [2022 2023]; % before Colossus began operating
+AFTER = [2025 2026]; % after operations began (2024 is the transition year)
+TRANSITION = 2024;
+periods = {EARLY, BEFORE, AFTER};
+labels = ["2020-21 (earlier check)", "2022-23 (before)", "2025-26 (after)"];
+% Cloud-coverage screen: a zone is used only if at least 30% of it is clear.
+% Convert that into a minimum number of 70 m ECOSTRESS pixels per zone.
+PIX_AREA = 70 * 70; % m^2 per pixel
+MIN_COVER = 0.30;
+MIN_NEAR = round(MIN_COVER * pi * 500^2 / PIX_AREA); % about 48
+MIN_RING = round(MIN_COVER * pi * (2000^2 - 500^2) / PIX_AREA); % about 721
+MIN_BG = round(MIN_COVER * pi * (5000^2 - 3000^2) / PIX_AREA); % about 3078
+NBOOT = 10000; % number of bootstrap resamples for confidence intervals
+DAY_CHANGE = 3.3; % daytime Step 1 change from Landsat (for comparison only)
+% Plot colours and labels
+ORANGE = [0.85 0.37 0.01];
+BLUE = [0.22 0.49 0.72];
+PURPLE = [0.48 0.00 0.47];
+GREY = [0.65 0.65 0.65];
+DEG = char(176); % degree symbol
+%% ---------------- 2. Read the CSV files ----------------
+col = readNight(colFile);
+bv = readNight(bvFile);
+fprintf('Scenes read (before cloud screening): Colossus %d, Brownsville %d\n', ...
+height(col), height(bv));
+%% ---------------- 3. Step 1: site minus background ring ----------------
+% For each scene: keep it only if both the 500 m circle and the 3-5 km ring
+% are at least 30% clear, then compute C = near - bg. If the same night
+% appears twice (Colossus sits where two ECOSTRESS tiles overlap), the two
+% values are averaged so that each night counts once.
+col1 = step1Nightly(col, MIN_NEAR, MIN_BG);
+bv1 = step1Nightly(bv, MIN_NEAR, MIN_BG);
+%% ---------------- 4. Step 2: Colossus ring minus Brownsville ring ----------------
+% For each site, keep nights when the 0.5-2 km ring is at least 30% clear,
+% then match the two sites on the same night and compute R.
+colR = ringNightly(col, MIN_RING);
+bvR = ringNightly(bv, MIN_RING);
+colR.Properties.VariableNames = {'night', 'ring_colossus', 'year', 'local_hour', 'n_scenes_colossus'};
+bvR.Properties.VariableNames = {'night', 'ring_brownsville', 'year_bv', 'local_hour_bv', 'n_scenes_brownsville'};
+pair = innerjoin(colR, bvR, 'Keys', 'night'); % same nights only
+pair.value = pair.ring_colossus - pair.ring_brownsville; % R for each night
+%% ---------------- 5. Averages for each period ----------------
+S1col = periodStats(col1, periods, labels);
+S1bv = periodStats(bv1, periods, labels);
+S2 = periodStats(pair, periods, labels);
+% Sensitivity check: only passes after midnight (00:00-05:00), when the
+% ground has had longest to cool, so waste heat should stand out most.
+col1late = col1(col1.local_hour < 5, :);
+S1late = periodStats(col1late, periods, labels);
+fprintf('\n=== STEP 1 - Colossus: site (0-500 m) minus 3-5 km ring (deg C) ===\n');
+disp(S1col);
+fprintf('=== STEP 1 - Brownsville: centre (0-500 m) minus 3-5 km ring (deg C) ===\n');
+disp(S1bv);
+fprintf('=== STEP 2 - Colossus 0.5-2 km ring minus Brownsville 0.5-2 km ring (deg C) ===\n');
+disp(S2);
+fprintf('=== Sensitivity - Colossus Step 1, after-midnight passes only ===\n');
+disp(S1late);
+%% ---------------- 6. Before-to-after changes ----------------
+% For each comparison: change = mean(after) - mean(before)
+% SE = standard error of the change
+% CI = 95% confidence interval (bootstrap, resampling the nights)
+% MDC = minimum detectable change = 2 x SE
+R = makeRow("Step 1 Colossus (after - before)", ...
+pick(col1, BEFORE), pick(col1, AFTER), NBOOT);
+R = [R; makeRow("Step 1 Brownsville (after - before)", ...
+pick(bv1, BEFORE), pick(bv1, AFTER), NBOOT)];
+R = [R; makeRow("Step 2 Colossus ring - Brownsville ring (after - before)", ...
+pick(pair, BEFORE), pick(pair, AFTER), NBOOT)];
+R = [R; makeRow("Pre-trend Colossus Step 1 (2022-23 minus 2020-21)", ...
+pick(col1, EARLY), pick(col1, BEFORE), NBOOT)];
+R = [R; makeRow("Sensitivity: Colossus Step 1, after-midnight only", ...
+pick(col1late, BEFORE), pick(col1late, AFTER), NBOOT)];
+% Full difference-in-differences: how much MORE the Colossus contrast changed
+% than the Brownsville contrast over the same years.
+R = [R; didRow("Difference-in-differences (Colossus minus Brownsville, Step 1)", ...
+pick(col1, BEFORE), pick(col1, AFTER), ...
+pick(bv1, BEFORE), pick(bv1, AFTER), NBOOT)];
+fprintf('=== BEFORE-TO-AFTER CHANGES (deg C) ===\n');
+disp(R);
+%% ---------------- 7. Plain-English summary ----------------
+c1 = R(1, :); % Step 1 Colossus row
+fprintf('\n--- Summary for the report ---\n');
+fprintf('Clear summer nights at Colossus (Step 1): %d before, %d after.\n', ...
+c1.n_before, c1.n_after);
+fprintf('Paired clear nights with Brownsville (Step 2): %d before, %d after.\n', ...
+R.n_before(3), R.n_after(3));
+fprintf(['At night, the Colossus site-minus-background contrast changed by %+.2f deg C ' ...
+'(95%% CI %+.2f to %+.2f), compared with %+.1f deg C in the daytime Landsat analysis.\n'], ...
+c1.change_C, c1.ci_low_C, c1.ci_high_C, DAY_CHANGE);
+if c1.ci_low_C > 0
+fprintf('The night-time increase is statistically clear (CI above zero).\n');
+elseif c1.ci_high_C < 0
+fprintf('The night-time contrast DECREASED (CI below zero).\n');
+else
+fprintf('The night-time change is not statistically clear (CI includes zero).\n');
+end
+fprintf('Minimum detectable change at night: %.2f deg C.\n', c1.mdc_C);
+%% ---------------- 8. Save tables ----------------
+writetable(R, 'Night_results_summary.csv');
+writetable(col1, 'Night_step1_Colossus_nightly.csv');
+writetable(bv1, 'Night_step1_Brownsville_nightly.csv');
+writetable(pair, 'Night_step2_paired_nightly.csv');
+fprintf('\nSaved: Night_results_summary.csv and three nightly CSV files.\n');
+%% ---------------- 9. Figures ----------------
+startup = [datetime(2024,7,1), datetime(2024,9,30)]; % reported start-up window
+% ---- Figure 1 (report Figure 7): Step 1 contrast for every clear night ----
+% Colossus: filled = pass after midnight (00:00-05:00), hollow = evening pass.
+% 2024 (transition year) nights are grey because they are not used in the
+% before/after comparison.
+f1 = figure('Color', 'w', 'Position', [100 100 1000 480]);
+hold on; grid on; box on;
+colMain = col1(col1.year ~= TRANSITION, :);
+colTr = col1(col1.year == TRANSITION, :);
+bvMain = bv1(bv1.year ~= TRANSITION, :);
+bvTr = bv1(bv1.year == TRANSITION, :);
+late = colMain.local_hour < 5;
+plot(colMain.night(late), colMain.value(late), 'o', 'MarkerSize', 7, ...
+'MarkerFaceColor', ORANGE, 'MarkerEdgeColor', ORANGE, ...
+'DisplayName', 'Colossus, pass 00:00-05:00');
+plot(colMain.night(~late), colMain.value(~late), 'o', 'MarkerSize', 7, 'LineWidth', 1.2, ...
+'MarkerFaceColor', 'w', 'MarkerEdgeColor', ORANGE, ...
+'DisplayName', 'Colossus, pass 20:00-23:59');
+plot(bvMain.night, bvMain.value, 's', 'MarkerSize', 7, ...
+'MarkerFaceColor', BLUE, 'MarkerEdgeColor', 'none', ...
+'DisplayName', 'Brownsville (control)');
+plot(colTr.night, colTr.value, 'o', 'MarkerSize', 7, ...
+'MarkerFaceColor', GREY, 'MarkerEdgeColor', 'none', ...
+'DisplayName', '2024 transition year (excluded)');
+plot(bvTr.night, bvTr.value, 's', 'MarkerSize', 7, ...
+'MarkerFaceColor', GREY, 'MarkerEdgeColor', 'none', 'HandleVisibility', 'off');
+% Horizontal lines = period means, labelled with their value.
+% Colossus labels go below its lines and Brownsville labels above, so they
+% stay apart (Brownsville's means are higher).
+addPeriodMeans(S1col, periods, ORANGE, 'below');
+addPeriodMeans(S1bv, periods, BLUE, 'above');
+formatTimeAxis(startup);
+ylabel(['Night-time contrast, site minus 3-5 km ring (' DEG 'C)']);
+title('Night-time surface-temperature contrast for every clear summer night, 2020-2026');
+legend('Location', 'southoutside', 'NumColumns', 3);
+saveFig(f1, 'Night_fig1_step1_contrast.png');
+% ---- Figure 2 (not in report): Step 2 regional check for every paired night ----
+f2 = figure('Color', 'w', 'Position', [100 100 1000 420]);
+hold on; grid on; box on;
+pairMain = pair(pair.year ~= TRANSITION, :);
+pairTr = pair(pair.year == TRANSITION, :);
+plot(pairMain.night, pairMain.value, 'd', 'MarkerSize', 7, ...
+'MarkerFaceColor', PURPLE, 'MarkerEdgeColor', 'none', ...
+'DisplayName', 'Colossus ring minus Brownsville ring');
+plot(pairTr.night, pairTr.value, 'd', 'MarkerSize', 7, ...
+'MarkerFaceColor', GREY, 'MarkerEdgeColor', 'none', ...
+'DisplayName', '2024 transition year (excluded)');
+addPeriodMeans(S2, periods, PURPLE, 'above');
+formatTimeAxis(startup);
+ylabel(['0.5-2 km ring difference (' DEG 'C)']);
+title('Night-time regional check: Colossus minus Brownsville, 0.5-2 km rings');
+legend('Location', 'southoutside', 'NumColumns', 3);
+saveFig(f2, 'Night_fig2_step2_regional.png');
+% ---- Figure 3 (report Figure 6): period means with 95% confidence bars ----
+% Bars = mean +/- t x standard error, with t chosen for each period's
+% number of nights (e.g. t = 2.78 for 5 nights, instead of 1.96).
+f3 = figure('Color', 'w', 'Position', [100 100 760 460]);
+hold on; grid on; box on;
+x = 1:numel(labels);
+hCol = S1col.ci_half_C;
+hBv = S1bv.ci_half_C;
+errorbar(x - 0.1, S1col.mean_C, hCol, 'o-', 'LineWidth', 1.5, ...
+'Color', ORANGE, 'MarkerFaceColor', ORANGE, 'DisplayName', 'Colossus');
+errorbar(x + 0.1, S1bv.mean_C, hBv, 's-', 'LineWidth', 1.5, ...
+'Color', BLUE, 'MarkerFaceColor', BLUE, 'DisplayName', 'Brownsville (control)');
+% Number of nights: Colossus below its bar, Brownsville above its bar
+for k = 1:numel(x)
+if ~isnan(S1col.mean_C(k))
+h = hCol(k); if isnan(h), h = 0; end
+text(x(k) - 0.1, S1col.mean_C(k) - h - 0.1, sprintf('n = %d', S1col.nights(k)), ...
+'HorizontalAlignment', 'center', 'VerticalAlignment', 'top', ...
+'Color', ORANGE, 'FontSize', 9);
+end
+if ~isnan(S1bv.mean_C(k))
+h = hBv(k); if isnan(h), h = 0; end
+text(x(k) + 0.1, S1bv.mean_C(k) + h + 0.1, sprintf('n = %d', S1bv.nights(k)), ...
+'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom', ...
+'Color', BLUE, 'FontSize', 9);
+end
+end
+% Leave room for the n labels (MATLAB does not resize the axes for text)
+allLo = [S1col.mean_C - hCol; S1bv.mean_C - hBv];
+allHi = [S1col.mean_C + hCol; S1bv.mean_C + hBv];
+ylim([min(allLo) - 0.6, max(allHi) + 0.6]);
+yline(0, ':k', 'HandleVisibility', 'off');
+xlim([0.5 numel(labels) + 0.5]);
+xticks(x); xticklabels(labels);
+ylabel(['Mean night-time contrast, site minus 3-5 km ring (' DEG 'C)']);
+title('Mean night-time contrast by period, with 95% confidence intervals');
+legend('Location', 'best');
+saveFig(f3, 'Night_fig3_period_means.png');
+fprintf('Saved three figures (PNG).\n');
+%% ========================================================================
+% LOCAL FUNCTIONS (MATLAB R2016b or later allows functions at the end)
+% ========================================================================
+function T = readNight(file)
+% Read one exported CSV and tidy it up.
+opts = detectImportOptions(file);
+% Keep text columns as text (stops MATLAB guessing they are dates)
+opts = setvartype(opts, {'site', 'night', 'local_time', 'scene'}, 'string');
+T = readtable(file, opts);
+% Convert the "night" label (e.g. 2025-07-02) into a real date
+T.night_date = datetime(T.night, 'InputFormat', 'yyyy-MM-dd');
+% Earth Engine writes -9999 when a zone had no clear pixels: make it NaN
+cols = {'near_C', 'ring_C', 'bg_C'};
+for k = 1:numel(cols)
+x = T.(cols{k});
+x(x == -9999) = NaN;
+T.(cols{k}) = x;
+end
+end
+function N = step1Nightly(T, minNear, minBg)
+% Step 1 for one site: screen for cloud, compute C = near - bg, one value per night.
+keep = T.near_px >= minNear & T.bg_px >= minBg & ...
+~isnan(T.near_C) & ~isnan(T.bg_C);
+T = T(keep, :);
+T.C = T.near_C - T.bg_C;
+N = nightlyMean(T, 'C');
+end
+function N = ringNightly(T, minRing)
+% Step 2 input for one site: nights when the 0.5-2 km ring is clear enough.
+keep = T.ring_px >= minRing & ~isnan(T.ring_C);
+N = nightlyMean(T(keep, :), 'ring_C');
+end
+function N = nightlyMean(T, var)
+% Average all scenes that belong to the same night, so each night counts once.
+if isempty(T)
+N = table(datetime.empty(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), ...
+'VariableNames', {'night', 'value', 'year', 'local_hour', 'n_scenes'});
+return
+end
+[g, nights] = findgroups(T.night_date);
+N = table(nights, 'VariableNames', {'night'});
+N.value = splitapply(@mean, T.(var), g); % nightly value
+N.year = year(N.night); % year of that night
+N.local_hour = splitapply(@(h) h(1), T.local_hour, g); % hour of first pass
+N.n_scenes = splitapply(@numel, T.(var), g); % scenes averaged
+end
+function x = pick(N, yrs)
+% Nightly values for the chosen years.
+x = N.value(ismember(N.year, yrs));
+end
+function S = periodStats(N, periods, labels)
+% Number of nights, mean, standard deviation, standard error and the
+% half-width of the 95% confidence interval (t x SE) for each period.
+n = numel(periods);
+S = table(labels(:), zeros(n, 1), NaN(n, 1), NaN(n, 1), NaN(n, 1), NaN(n, 1), ...
+'VariableNames', {'period', 'nights', 'mean_C', 'sd_C', 'se_C', 'ci_half_C'});
+for k = 1:n
+x = pick(N, periods{k});
+S.nights(k) = numel(x);
+if ~isempty(x)
+S.mean_C(k) = mean(x);
+end
+if numel(x) >= 2
+S.sd_C(k) = std(x);
+S.se_C(k) = std(x) / sqrt(numel(x));
+S.ci_half_C(k) = tcrit95(numel(x)) * S.se_C(k);
+end
+end
+end
+function tc = tcrit95(n)
+% Two-sided 95% t critical value for n observations (n - 1 degrees of
+% freedom), without the Statistics Toolbox. Uses the link between the
+% t distribution and the incomplete beta function (betaincinv is in base
+% MATLAB). Examples: n = 5 gives 2.776, n = 11 gives 2.228.
+df = n - 1;
+xb = betaincinv(0.05, df / 2, 0.5);
+tc = sqrt(df * (1 - xb) / xb);
+end
+function row = makeRow(name, xb, xa, nboot)
+% Change between two groups of nights (after minus before), with uncertainty.
+change = NaN; se = NaN; lo = NaN; hi = NaN;
+if numel(xb) >= 2 && numel(xa) >= 2
+change = mean(xa) - mean(xb);
+se = sqrt(var(xa) / numel(xa) + var(xb) / numel(xb));
+boot = zeros(nboot, 1);
+for i = 1:nboot
+% resample nights with replacement in each group
+boot(i) = mean(xa(randi(numel(xa), numel(xa), 1))) ...
+- mean(xb(randi(numel(xb), numel(xb), 1)));
+end
+lo = pct(boot, 2.5);
+hi = pct(boot, 97.5);
+end
+row = table(name, numel(xb), numel(xa), change, lo, hi, se, 2 * se, ...
+'VariableNames', {'comparison', 'n_before', 'n_after', 'change_C', ...
+'ci_low_C', 'ci_high_C', 'se_C', 'mdc_C'});
+end
+function row = didRow(name, cb, ca, bb, ba, nboot)
+% Difference-in-differences: (Colossus after - before) - (Brownsville after - before).
+change = NaN; se = NaN; lo = NaN; hi = NaN;
+if all([numel(cb), numel(ca), numel(bb), numel(ba)] >= 2)
+change = (mean(ca) - mean(cb)) - (mean(ba) - mean(bb));
+se = sqrt(var(ca) / numel(ca) + var(cb) / numel(cb) + ...
+var(ba) / numel(ba) + var(bb) / numel(bb));
+boot = zeros(nboot, 1);
+for i = 1:nboot
+r = @(x) x(randi(numel(x), numel(x), 1)); % one resample
+boot(i) = (mean(r(ca)) - mean(r(cb))) - (mean(r(ba)) - mean(r(bb)));
+end
+lo = pct(boot, 2.5);
+hi = pct(boot, 97.5);
+end
+row = table(name, numel(cb), numel(ca), change, lo, hi, se, 2 * se, ...
+'VariableNames', {'comparison', 'n_before', 'n_after', 'change_C', ...
+'ci_low_C', 'ci_high_C', 'se_C', 'mdc_C'});
+end
+function v = pct(x, p)
+% Percentile without the Statistics Toolbox.
+x = sort(x(:));
+idx = min(numel(x), max(1, round(p / 100 * numel(x))));
+v = x(idx);
+end
+function addPeriodMeans(S, periods, colour, labelPos)
+% Draw a horizontal line at each period's mean, spanning June-August of those
+% years, and write the mean value (deg C) beside it.
+% labelPos = 'above' or 'below' the line (use opposite sides for the two
+% sites so the labels do not overlap).
+if nargin < 4, labelPos = 'above'; end
+offset = 0.25; % gap between line and label (deg C)
+if strcmp(labelPos, 'below')
+offset = -offset; valign = 'top';
+else
+valign = 'bottom';
+end
+for k = 1:numel(periods)
+if ~isnan(S.mean_C(k))
+yrs = periods{k};
+t = [datetime(yrs(1), 6, 1), datetime(yrs(end), 8, 31)];
+plot(t, [S.mean_C(k) S.mean_C(k)], '-', 'Color', colour, ...
+'LineWidth', 2, 'HandleVisibility', 'off');
+tMid = t(1) + (t(2) - t(1)) / 2; % middle of the line
+text(tMid, S.mean_C(k) + offset, ...
+sprintf('mean %+.2f %sC', S.mean_C(k), char(176)), ...
+'Color', colour, 'FontSize', 9, 'FontWeight', 'bold', ...
+'HorizontalAlignment', 'center', 'VerticalAlignment', valign, ...
+'BackgroundColor', 'w', 'Margin', 1);
+end
+end
+end
+function formatTimeAxis(startup)
+% Shared formatting for the night-by-night figures: shaded start-up window,
+% zero line, and one year label centred on each summer.
+try
+% xregion needs MATLAB R2023a or later
+xregion(startup(1), startup(2), 'FaceColor', [0.75 0.75 0.75], 'FaceAlpha', 0.4, ...
+'DisplayName', 'Reported start-up (Jul-Sep 2024)');
+catch
+% Older MATLAB: fall back to two dashed lines
+xline(startup(1), '--k', 'HandleVisibility', 'off');
+xline(startup(2), '--k', 'Reported start-up', 'HandleVisibility', 'off');
+end
+yline(0, ':k', 'HandleVisibility', 'off');
+yrs = 2020:2026;
+xticks(datetime(yrs, 7, 15)); % mid-summer of each year
+xticklabels(string(yrs));
+xlim([datetime(2020, 5, 15), datetime(2026, 9, 15)]);
+xlabel('Summer (June-August)');
+end
+function saveFig(f, name)
+% Save a figure at 300 dpi (falls back to saveas on older MATLAB versions).
+try
+exportgraphics(f, name, 'Resolution', 300);
+catch
+saveas(f, name);
+end
+end
